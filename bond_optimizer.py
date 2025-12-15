@@ -14,8 +14,8 @@ st.markdown("""
 1. **收益最大化**：追求最高配息。
 2. **債券梯**：平均佈局年期，降低風險。
 3. **槓鈴策略**：長短債配置。
-4. **相對價值**：找出被低估的便宜債券。
-5. **領息頻率組合**：<span style='color:orange'>🔥客製化</span> 自訂本金與領息頻率 (月配/雙月/季配)，試算退休現金流。
+4. **相對價值**：找出被低估的便宜債券 (<span style='color:red'>New: 可篩選配息頻率</span>)。
+5. **領息頻率組合**：自訂本金與領息頻率，試算退休現金流。
 """, unsafe_allow_html=True)
 
 # --- 2. 輔助函式 ---
@@ -27,6 +27,15 @@ rating_map = {
     'B+': 14, 'B': 15, 'B-': 16
 }
 
+def standardize_frequency(val):
+    """將各種頻率寫法標準化"""
+    s = str(val).strip().upper()
+    if any(x in s for x in ['M', 'MONTH', '月']): return '月配'
+    if any(x in s for x in ['Q', 'QUARTER', '季']): return '季配'
+    if any(x in s for x in ['A', 'ANNUAL', 'YEAR', '年']): return '年配'
+    # 預設半年配 (S, Semi, 或其他)
+    return '半年配'
+
 @st.cache_data
 def clean_data(file):
     try:
@@ -37,13 +46,15 @@ def clean_data(file):
             
         col_mapping = {}
         for col in df.columns:
-            if 'ISIN' in col.upper(): col_mapping[col] = 'ISIN'
+            c_up = col.upper()
+            if 'ISIN' in c_up: col_mapping[col] = 'ISIN'
             elif '發行' in col or '名稱' in col: col_mapping[col] = 'Name'
-            elif 'YTM' in col.upper() or 'YIELD' in col.upper(): col_mapping[col] = 'YTM'
-            elif '存續' in col or 'DURATION' in col.upper(): col_mapping[col] = 'Duration'
-            elif 'S&P' in col.upper(): col_mapping[col] = 'SP_Rating'
-            elif 'FITCH' in col.upper(): col_mapping[col] = 'Fitch_Rating'
-            elif '到期' in col or 'MATURITY' in col.upper(): col_mapping[col] = 'Maturity'
+            elif 'YTM' in c_up or 'YIELD' in c_up: col_mapping[col] = 'YTM'
+            elif '存續' in col or 'DURATION' in c_up: col_mapping[col] = 'Duration'
+            elif 'S&P' in c_up: col_mapping[col] = 'SP_Rating'
+            elif 'FITCH' in c_up: col_mapping[col] = 'Fitch_Rating'
+            elif '到期' in col or 'MATURITY' in c_up: col_mapping[col] = 'Maturity'
+            elif '頻率' in col or 'FREQ' in c_up: col_mapping[col] = 'Frequency'
         
         df = df.rename(columns=col_mapping)
         
@@ -62,6 +73,12 @@ def clean_data(file):
         df['Rating_Source'] = df['Rating_Source'].astype(str).str.strip().str.upper()
         df['Credit_Score'] = df['Rating_Source'].map(rating_map).fillna(10)
         
+        # 頻率處理 (若無欄位則預設半年配)
+        if 'Frequency' in df.columns:
+            df['Frequency'] = df['Frequency'].apply(standardize_frequency)
+        else:
+            df['Frequency'] = '半年配'
+
         # 月份處理
         df['Pay_Month'] = 0
         if 'Maturity' in df.columns:
@@ -145,9 +162,16 @@ def run_barbell(df, short_limit, long_limit, long_weight, allow_dup):
 def fit_yield_curve(x, a, b):
     return a + b * np.log(x)
 
-def run_relative_value(df, allow_dup, top_n, min_dur):
+def run_relative_value(df, allow_dup, top_n, min_dur, target_freqs):
+    """
+    相對價值策略：
+    1. 使用「所有符合信評」的債券來計算合理價值曲線 (Fair Value) -> 確保 Alpha 計算準確
+    2. 從中「篩選」出符合 min_dur 和 target_freqs 的債券作為建議名單
+    """
     df_calc = df[df['Duration'] > 0.1].copy()
     if len(df_calc) < 5: return pd.DataFrame(), pd.DataFrame()
+    
+    # 1. 建立模型 (使用整體數據)
     try:
         popt, _ = curve_fit(fit_yield_curve, df_calc['Duration'], df_calc['YTM'])
         df_calc['Fair_YTM'] = fit_yield_curve(df_calc['Duration'], *popt)
@@ -158,7 +182,17 @@ def run_relative_value(df, allow_dup, top_n, min_dur):
         df_calc['Fair_YTM'] = p(df_calc['Duration'])
         df_calc['Alpha'] = df_calc['YTM'] - df_calc['Fair_YTM']
 
-    pool = df_calc[df_calc['Duration'] >= min_dur].sort_values('Alpha', ascending=False)
+    # 2. 篩選建議名單 (Duration & Frequency)
+    # 先篩選 Duration
+    pool = df_calc[df_calc['Duration'] >= min_dur]
+    
+    # 再篩選 Frequency (如果有指定)
+    if target_freqs:
+        pool = pool[pool['Frequency'].isin(target_freqs)]
+    
+    # 最後按 Alpha 排序
+    pool = pool.sort_values('Alpha', ascending=False)
+    
     selected = []
     used_issuers = set()
     weight_per_bond = 1.0 / top_n
@@ -266,18 +300,25 @@ if uploaded_file:
         elif strategy == "相對價值":
             min_dur = st.sidebar.number_input("最低年期", 2.0)
             top_n = st.sidebar.slider("挑選幾檔", 3, 10, 5)
-            target_rating = st.sidebar.multiselect("篩選信評", sorted(df_clean['Rating_Source'].unique()))
+            
+            # 信評篩選
+            target_rating = st.sidebar.multiselect("篩選信評 (推薦)", sorted(df_clean['Rating_Source'].unique()))
+            
+            # 頻率篩選 (New)
+            available_freqs = sorted(df_clean['Frequency'].unique())
+            target_freqs = st.sidebar.multiselect("篩選配息頻率 (New)", options=available_freqs, placeholder="全選 (預設)")
+            
             if st.sidebar.button("🚀 計算"):
                 df_t = df_clean[df_clean['Rating_Source'].isin(target_rating)] if target_rating else df_clean
-                portfolio, df_with_alpha = run_relative_value(df_t, allow_dup, top_n, min_dur)
+                
+                # 執行相對價值 (傳入頻率參數)
+                portfolio, df_with_alpha = run_relative_value(df_t, allow_dup, top_n, min_dur, target_freqs)
 
         elif strategy == "領息頻率組合":
             st.sidebar.caption("利用不同月份的半年配債券，構建現金流。")
             freq_type = st.sidebar.selectbox("目標領息頻率", ["月月配 (12次/年)", "雙月配 (6次/年)", "季季配 (4次/年)"])
-            
             if df_clean['Is_Simulated_Month'].iloc[0]:
                 st.sidebar.warning("⚠️ 警告：使用模擬月份 (請補上到期日欄位)")
-            
             if st.sidebar.button("🚀 計算"):
                 portfolio = run_cash_flow_strategy(df_clean, allow_dup, freq_type)
 
@@ -298,16 +339,17 @@ if uploaded_file:
             c1, c2 = st.columns([4, 6])
             with c1:
                 st.subheader("📋 建議清單")
-                cols = ['Name', 'YTM', 'Duration', 'Allocation %', 'Annual_Coupon_Amt']
+                cols = ['Name', 'YTM', 'Duration', 'Frequency', 'Allocation %', 'Annual_Coupon_Amt']
+                # 如果有 Frequency 欄位就顯示
+                if 'Frequency' not in portfolio.columns: cols.remove('Frequency')
                 if 'Cycle_Str' in portfolio.columns: cols.insert(1, 'Cycle_Str')
+                
                 st.dataframe(portfolio[cols], hide_index=True, use_container_width=True, key="res_tab")
 
             with c2:
-                # 使用 Tabs 分頁
                 tab1, tab2 = st.tabs(["📊 策略分析", "💰 現金流試算"])
                 
                 with tab1:
-                    # 邏輯：根據不同策略顯示「最適合」的圖表
                     if strategy == "相對價值" and not df_with_alpha.empty:
                         st.subheader("相對價值回歸分析")
                         base_data = df_with_alpha
@@ -321,9 +363,9 @@ if uploaded_file:
                             y_fair = p(x_range)
                         
                         fig_rv = go.Figure()
-                        fig_rv.add_trace(go.Scatter(x=base_data['Duration'], y=base_data['YTM'], mode='markers', name='市場', marker=dict(color='lightgrey', size=6)))
+                        fig_rv.add_trace(go.Scatter(x=base_data['Duration'], y=base_data['YTM'], mode='markers', name='市場', marker=dict(color='lightgrey', size=6), hovertext=base_data['Name']))
                         fig_rv.add_trace(go.Scatter(x=x_range, y=y_fair, mode='lines', name='合理價值', line=dict(dash='dash', color='blue')))
-                        fig_rv.add_trace(go.Scatter(x=portfolio['Duration'], y=portfolio['YTM'], mode='markers', name='低估買入', marker=dict(color='red', size=15, symbol='star')))
+                        fig_rv.add_trace(go.Scatter(x=portfolio['Duration'], y=portfolio['YTM'], mode='markers', name='低估買入', marker=dict(color='red', size=15, symbol='star'), hovertext=portfolio['Name']))
                         fig_rv.update_layout(xaxis_title="存續期間 (Duration)", yaxis_title="殖利率 (YTM)")
                         st.plotly_chart(fig_rv, use_container_width=True, key="rv_chart_main")
                         
@@ -331,7 +373,6 @@ if uploaded_file:
                          st.info("👈 請切換至「現金流試算」分頁查看詳細圖表")
                          
                     else:
-                        # 對於 最大收益/債券梯/槓鈴，恢復顯示「散佈圖」
                         st.subheader("風險/收益分佈圖")
                         df_raw['Type'] = '未選入'
                         portfolio['Type'] = '建議買入'
@@ -357,11 +398,27 @@ if uploaded_file:
                     months = list(range(1, 13))
                     cash_flow = [0] * 12
                     for idx, row in portfolio.iterrows():
-                        coupon_amt = row['Annual_Coupon_Amt'] / 2
-                        if 'Pay_Month' in row: m = int(row['Pay_Month'])
-                        else: m = np.random.randint(1,7)
-                        cash_flow[m-1] += coupon_amt
-                        cash_flow[m+5] += coupon_amt
+                        # 這裡的邏輯需要依賴「頻率」來更準確計算
+                        # 若無頻率欄位，維持預設半年配
+                        freq_val = row.get('Frequency', '半年配')
+                        coupon_amt = row['Annual_Coupon_Amt']
+                        
+                        m = int(row['Pay_Month']) if 'Pay_Month' in row else np.random.randint(1,7)
+                        m_idx = m - 1 # 0-11
+                        
+                        if freq_val == '月配':
+                            per_pay = coupon_amt / 12
+                            for i in range(12): cash_flow[i] += per_pay
+                        elif freq_val == '季配':
+                            per_pay = coupon_amt / 4
+                            # 假設 1,4,7,10
+                            for i in range(4): cash_flow[(m_idx + i*3) % 12] += per_pay
+                        elif freq_val == '年配':
+                            cash_flow[m_idx] += coupon_amt
+                        else: # 半年配
+                            per_pay = coupon_amt / 2
+                            cash_flow[m_idx] += per_pay
+                            cash_flow[(m_idx + 6) % 12] += per_pay
                     
                     cf_df = pd.DataFrame({'Month': [f"{i}月" for i in months], 'Amount': cash_flow})
                     fig_cf = px.bar(cf_df, x='Month', y='Amount', text_auto=',.0f', title=f"本金 ${investment_amt:,.0f} 之現金流模擬")
