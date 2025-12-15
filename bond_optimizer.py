@@ -15,7 +15,7 @@ st.markdown("""
 2. **債券梯**：平均佈局年期，降低風險。
 3. **槓鈴策略**：長短債配置。
 4. **相對價值**：找出被低估的便宜債券。
-5. **現金流組合**：自訂本金與領息頻率，試算退休現金流。
+5. **領息頻率組合**：<span style='color:orange'>🔥客製化</span> 自訂本金與領息頻率 (月配/雙月/季配)，試算退休現金流。
 """, unsafe_allow_html=True)
 
 # --- 2. 輔助函式 ---
@@ -227,7 +227,7 @@ if uploaded_file:
         st.sidebar.header("🧠 步驟 2: 選擇策略")
         strategy = st.sidebar.radio(
             "請選擇投資策略：",
-            ["收益最大化", "債券梯", "槓鈴策略", "相對價值", "現金流組合"]
+            ["收益最大化", "債券梯", "槓鈴策略", "相對價值", "領息頻率組合"]
         )
         
         # 本金設定
@@ -271,7 +271,7 @@ if uploaded_file:
                 df_t = df_clean[df_clean['Rating_Source'].isin(target_rating)] if target_rating else df_clean
                 portfolio, df_with_alpha = run_relative_value(df_t, allow_dup, top_n, min_dur)
 
-        elif strategy == "現金流組合":
+        elif strategy == "領息頻率組合":
             st.sidebar.caption("利用不同月份的半年配債券，構建現金流。")
             freq_type = st.sidebar.selectbox("目標領息頻率", ["月月配 (12次/年)", "雙月配 (6次/年)", "季季配 (4次/年)"])
             
@@ -303,7 +303,7 @@ if uploaded_file:
                 st.dataframe(portfolio[cols], hide_index=True, use_container_width=True, key="res_tab")
 
             with c2:
-                # 使用 Tabs 分頁解決圖表過多問題
+                # 使用 Tabs 分頁
                 tab1, tab2 = st.tabs(["📊 策略分析", "💰 現金流試算"])
                 
                 with tab1:
@@ -327,7 +327,7 @@ if uploaded_file:
                         fig_rv.update_layout(xaxis_title="存續期間 (Duration)", yaxis_title="殖利率 (YTM)")
                         st.plotly_chart(fig_rv, use_container_width=True, key="rv_chart_main")
                         
-                    elif strategy == "現金流組合":
+                    elif strategy == "領息頻率組合":
                          st.info("👈 請切換至「現金流試算」分頁查看詳細圖表")
                          
                     else:
