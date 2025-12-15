@@ -4,182 +4,196 @@ import numpy as np
 from scipy.optimize import linprog
 import plotly.express as px
 
-# --- 1. 頁面設定 ---
-st.set_page_config(page_title="債券組合優化器 (Bond Optimizer)", layout="wide")
+# --- 1. 基礎設定 ---
+st.set_page_config(page_title="債券組合優化器 Pro (Excel版)", layout="wide")
 
-st.title("🛡️ 債券投資組合優化器 (Yield Max Strategy)")
+st.title("🛡️ 債券投資組合優化器 Pro")
 st.markdown("""
-此工具使用 **線性規劃 (Linear Programming)**，在滿足「存續期間」與「信用評等」限制下，
-尋找能提供 **最大化殖利率 (Max YTM)** 的最佳配置。
+### 使用說明
+請上傳包含以下欄位的 Excel 或 CSV 檔案：
+- **ISIN** (或代碼)
+- **發行人/保證人** (或名稱)
+- **YTM** (殖利率)
+- **存續期間** (Duration)
+- **S&P** 或 **Fitch** (信用評等)
 """)
 
-# --- 2. 模擬數據生成 (Mock Data) ---
-@st.cache_data
-def get_bond_data():
-    data = {
-        'Bond_Name': [
-            'US Treasury 10Y', 'US Treasury 2Y', 
-            'Apple Corp (AA)', 'Microsoft (AAA)', 'JPM Chase (A)', 
-            'Ford Motor (BB)', 'Energy ETF (B)', 'Telekom Bond (BBB)',
-            'Short-Term Corp (A)', 'Long-Term Infra (BBB)'
-        ],
-        'Sector': ['Gov', 'Gov', 'Tech', 'Tech', 'Finance', 'Auto', 'Energy', 'Telecom', 'Finance', 'Utility'],
-        'YTM': [0.038, 0.042, 0.051, 0.049, 0.056, 0.078, 0.085, 0.062, 0.053, 0.065],
-        'Duration': [8.5, 1.8, 7.2, 9.0, 5.5, 4.2, 5.0, 6.8, 2.5, 12.0],
-        'Credit_Score': [1, 1, 2, 1, 3, 5, 6, 4, 3, 4] 
-        # Score Logic: 1=AAA/Gov, 2=AA, 3=A, 4=BBB, 5=BB, 6=B
-    }
-    return pd.DataFrame(data)
+# --- 2. 輔助函式：信評轉分數 ---
+# 我們將 AAA 定義為 1 分，分數越低越好。BBB- 為 10 分。
+rating_map = {
+    'AAA': 1, 'AA+': 2, 'AA': 3, 'AA-': 4,
+    'A+': 5, 'A': 6, 'A-': 7,
+    'BBB+': 8, 'BBB': 9, 'BBB-': 10,
+    'BB+': 11, 'BB': 12, 'BB-': 13,
+    'B+': 14, 'B': 15, 'B-': 16
+}
 
-df = get_bond_data()
+def clean_data(uploaded_file):
+    """讀取並清洗使用者上傳的檔案"""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"檔案讀取失敗: {e}")
+        return None
 
-# 信評文字對照表 (用於顯示)
-credit_map = {1: 'AAA/Gov', 2: 'AA', 3: 'A', 4: 'BBB', 5: 'BB', 6: 'B'}
-df['Credit_Rating'] = df['Credit_Score'].map(credit_map)
-
-# --- 3. 側邊欄：使用者參數設定 ---
-st.sidebar.header("⚙️ 優化限制參數")
-
-target_duration = st.sidebar.slider(
-    "目標存續期間上限 (Target Duration)", 
-    min_value=2.0, max_value=10.0, value=6.0, step=0.5,
-    help="投資組合的加權平均存續期間將小於此數值 (控制利率風險)"
-)
-
-target_credit = st.sidebar.slider(
-    "目標平均信評分數上限", 
-    min_value=1.0, max_value=5.0, value=3.5, step=0.1,
-    help="1=AAA, 3=A, 4=BBB, 5=BB。數值越低信評越好。"
-)
-st.sidebar.caption(f"目前設定相當於平均信評約: {credit_map.get(int(round(target_credit)), 'Mix')}")
-
-max_single_weight = st.sidebar.slider(
-    "單檔債券持倉上限", 
-    min_value=0.1, max_value=1.0, value=0.3, step=0.05,
-    help="避免過度集中於單一債券"
-)
-
-# --- 4. 優化核心邏輯 (Solver) ---
-def optimize_portfolio(df, max_dur, max_credit, max_weight):
-    n_bonds = len(df)
+    # 1. 欄位名稱標準化 (避免欄位名稱有些微差異)
+    # 這裡做一個簡單的映射，確保程式能找到對應的欄位
+    col_mapping = {}
+    for col in df.columns:
+        if 'ISIN' in col.upper(): col_mapping[col] = 'ISIN'
+        elif '發行' in col or '名稱' in col: col_mapping[col] = 'Name'
+        elif 'YTM' in col.upper() or 'YIELD' in col.upper(): col_mapping[col] = 'YTM'
+        elif '存續' in col or 'DURATION' in col.upper(): col_mapping[col] = 'Duration'
+        elif 'S&P' in col.upper(): col_mapping[col] = 'SP_Rating'
+        elif 'FITCH' in col.upper(): col_mapping[col] = 'Fitch_Rating'
     
-    # 目標：Maximize YTM => Minimize (-YTM)
-    c = -1 * df['YTM'].values
+    df = df.rename(columns=col_mapping)
     
-    # 不等式限制 (Ax <= b)
-    # 1. Duration <= max_dur
-    # 2. Credit Score <= max_credit
-    A_ub = np.array([
-        df['Duration'].values,
-        df['Credit_Score'].values
-    ])
-    b_ub = np.array([max_dur, max_credit])
-    
-    # 等式限制 (Ax = b): 權重總和 = 1
-    A_eq = np.array([np.ones(n_bonds)])
-    b_eq = np.array([1.0])
-    
-    # 邊界: 0 <= weight <= max_weight
-    bounds = [(0, max_weight) for _ in range(n_bonds)]
-    
-    # 求解
-    result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-    
-    return result
+    # 檢查必要欄位是否存在
+    required_cols = ['ISIN', 'Name', 'YTM', 'Duration']
+    if not all(col in df.columns for col in required_cols):
+        st.error(f"錯誤：檔案缺少必要欄位。偵測到的欄位：{list(df.columns)}")
+        return None
 
-# 執行按鈕
-if st.sidebar.button("🚀 開始計算最佳組合"):
-    result = optimize_portfolio(df, target_duration, target_credit, max_single_weight)
+    # 2. 數據清洗
+    # 強制將數值欄位轉為數字，無法轉的 (如文字) 變 NaN
+    df['YTM'] = pd.to_numeric(df['YTM'], errors='coerce')
+    df['Duration'] = pd.to_numeric(df['Duration'], errors='coerce')
     
-    if result.success:
-        st.success("✅ 優化成功！已找到最佳配置。")
-        
-        # 處理結果
-        df['Optimal_Weight'] = result.x
-        portfolio = df[df['Optimal_Weight'] > 0.001].copy()
-        portfolio['Allocation %'] = (portfolio['Optimal_Weight'] * 100).round(2)
-        
-        # 計算組合整體指標
-        port_ytm = (portfolio['YTM'] * portfolio['Optimal_Weight']).sum()
-        port_dur = (portfolio['Duration'] * portfolio['Optimal_Weight']).sum()
-        port_credit = (portfolio['Credit_Score'] * portfolio['Optimal_Weight']).sum()
-        
-        # --- 5. 顯示結果 ---
-        
-        # KPI 指標卡
-        col1, col2, col3 = st.columns(3)
-        col1.metric("預期殖利率 (Yield)", f"{port_ytm:.2%}", delta="最大化目標")
-        col2.metric("平均存續期間 (Duration)", f"{port_dur:.2f} 年", delta=f"限制 < {target_duration}")
-        col3.metric("平均信評分數", f"{port_credit:.2f}", delta=f"限制 < {target_credit}")
-        
-        st.divider()
+    # 移除 YTM 或 Duration 是空值的行 (這會自動過濾掉檔案中間的髒文字)
+    df = df.dropna(subset=['YTM', 'Duration'])
+    
+    # 移除 YTM <= 0 的行 (負利率或錯誤數據)
+    df = df[df['YTM'] > 0]
 
-        # 版面配置：左圖右表
-        chart_col, table_col = st.columns([1, 1])
-        
-        with table_col:
-            st.subheader("📋 建議持倉明細")
-            display_cols = ['Bond_Name', 'Credit_Rating', 'YTM', 'Duration', 'Allocation %']
-            
-            # 格式化顯示
-            st.dataframe(
-                portfolio[display_cols].sort_values(by='Allocation %', ascending=False),
-                hide_index=True,
-                use_container_width=True
-            )
-            
-            # 圓餅圖
-            fig_pie = px.pie(portfolio, values='Allocation %', names='Bond_Name', title='資產配置比例')
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with chart_col:
-            st.subheader("📊 風險/報酬定位圖")
-            
-            # 建立散佈圖數據：所有債券 + 最佳組合
-            plot_df = df.copy()
-            plot_df['Type'] = '個別債券'
-            plot_df['Size'] = 10
-            
-            # 新增一行代表「最佳組合」
-            new_row = {
-                'Bond_Name': '★ 最佳優化組合',
-                'YTM': port_ytm,
-                'Duration': port_dur,
-                'Type': 'Optimized Portfolio',
-                'Size': 25,
-                'Credit_Rating': 'Mix'
-            }
-            # 使用 pd.concat 替代 append
-            plot_df = pd.concat([plot_df, pd.DataFrame([new_row])], ignore_index=True)
-
-            # 繪圖 (X=Duration/Risk, Y=YTM/Return)
-            fig_scatter = px.scatter(
-                plot_df, 
-                x='Duration', 
-                y='YTM', 
-                color='Type',
-                size='Size',
-                hover_data=['Bond_Name', 'Credit_Rating'],
-                color_discrete_map={'個別債券': '#636EFA', 'Optimized Portfolio': '#EF553B'},
-                title="YTM vs Duration (尋找效率前緣)"
-            )
-            
-            # 加入限制線 (視覺化邊界)
-            fig_scatter.add_vline(x=target_duration, line_dash="dash", line_color="green", annotation_text="Duration Limit")
-            fig_scatter.update_layout(yaxis_tickformat='.1%')
-            
-            st.plotly_chart(fig_scatter, use_container_width=True)
-            st.info("💡 說明：紅點是優化後的組合。它通常會位於所有藍點連線的上方邊界（效率前緣），代表在相同的存續期間風險下，獲得了最高的殖利率。")
-
+    # 3. 處理信評 (文字轉數字)
+    # 優先使用 S&P，如果沒有則用 Fitch
+    if 'SP_Rating' in df.columns:
+        df['Rating_Source'] = df['SP_Rating']
+    elif 'Fitch_Rating' in df.columns:
+        df['Rating_Source'] = df['Fitch_Rating']
     else:
-        st.error("❌ 無法找到可行解！")
-        st.warning("""
-        原因可能是限制條件過於嚴格。
-        建議嘗試：
-        1. 提高「目標存續期間上限」
-        2. 提高「目標平均信評分數」（接受較低的信評）
-        3. 提高「單檔債券持倉上限」
-        """)
+        # 如果都沒有信評，預設給 BBB (9分) 以免程式崩潰，但在實務上應剔除
+        df['Rating_Source'] = 'BBB' 
+
+    # 將文字信評去除空白並轉大寫
+    df['Rating_Source'] = df['Rating_Source'].astype(str).str.strip().str.upper()
+    
+    # 映射為分數
+    df['Credit_Score'] = df['Rating_Source'].map(rating_map)
+    
+    # 如果對應不到 (例如沒信評)，填入 10 (BBB-) 或是選擇剔除
+    df['Credit_Score'] = df['Credit_Score'].fillna(10)
+
+    # 顯示給使用者看用的信評 (反向查找)
+    # 為了方便，我們直接保留原始文字
+    
+    return df
+
+# --- 3. 側邊欄與檔案上傳 ---
+uploaded_file = st.sidebar.file_uploader("📂 步驟 1: 上傳債券清單 (Excel/CSV)", type=['xlsx', 'xls', 'csv'])
+
+if uploaded_file is not None:
+    df_clean = clean_data(uploaded_file)
+    
+    if df_clean is not None:
+        st.sidebar.success(f"成功讀取 {len(df_clean)} 檔有效債券！")
         
+        # --- 設定參數 ---
+        st.sidebar.header("⚙️ 步驟 2: 設定優化目標")
+        
+        target_duration = st.sidebar.slider("目標存續期間上限 (年)", 2.0, 15.0, 6.0, 0.5)
+        
+        # 讓使用者選擇信評上限 (顯示文字，但背後傳數字)
+        rating_options = list(rating_map.keys())
+        target_credit_label = st.sidebar.select_slider(
+            "目標平均信評 (最差允許到)", 
+            options=rating_options, 
+            value='A-' # 預設 A-
+        )
+        target_credit_score = rating_map[target_credit_label]
+        
+        max_single_weight = st.sidebar.slider("單檔持倉上限 (%)", 5, 50, 20, 5) / 100.0
+
+        # --- 4. 優化引擎 ---
+        if st.sidebar.button("🚀 開始計算最佳組合"):
+            # 準備數據
+            n_bonds = len(df_clean)
+            c = -1 * df_clean['YTM'].values # 目標: Max YTM
+            
+            # 限制條件
+            A_ub = np.array([
+                df_clean['Duration'].values,
+                df_clean['Credit_Score'].values
+            ])
+            b_ub = np.array([target_duration, target_credit_score])
+            
+            A_eq = np.array([np.ones(n_bonds)])
+            b_eq = np.array([1.0])
+            
+            bounds = [(0, max_single_weight) for _ in range(n_bonds)]
+            
+            # 求解
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+            
+            if res.success:
+                st.success("✅ 優化成功！")
+                
+                # 整理結果
+                df_clean['Weight'] = res.x
+                portfolio = df_clean[df_clean['Weight'] > 0.001].copy()
+                portfolio['Allocation %'] = (portfolio['Weight'] * 100).round(2)
+                
+                # 計算組合數據
+                port_ytm = (portfolio['YTM'] * portfolio['Weight']).sum()
+                port_dur = (portfolio['Duration'] * portfolio['Weight']).sum()
+                
+                # 顯示指標
+                col1, col2, col3 = st.columns(3)
+                col1.metric("預期年化報酬 (YTM)", f"{port_ytm:.2f}%")
+                col2.metric("平均存續期間", f"{port_dur:.2f} 年")
+                col3.metric("平均信評限制", target_credit_label)
+                
+                st.divider()
+                
+                # 左右佈局
+                c1, c2 = st.columns([1, 1])
+                
+                with c1:
+                    st.subheader("📋 建議配置清單")
+                    st.dataframe(
+                        portfolio[['Name', 'ISIN', 'Rating_Source', 'YTM', 'Duration', 'Allocation %']]
+                        .sort_values('Allocation %', ascending=False),
+                        hide_index=True
+                    )
+                    
+                    # 下載按鈕
+                    csv = portfolio.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button("下載配置結果 (CSV)", csv, "optimized_portfolio.csv", "text/csv")
+
+                with c2:
+                    st.subheader("📊 配置視覺化")
+                    fig = px.pie(portfolio, values='Allocation %', names='Name', title='發行人分散比例')
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # 風險分布圖
+                    df_clean['Type'] = '未選入'
+                    portfolio['Type'] = '建議買入'
+                    plot_data = pd.concat([df_clean, portfolio])
+                    
+                    fig2 = px.scatter(
+                        plot_data, x='Duration', y='YTM', color='Type',
+                        color_discrete_map={'未選入': 'lightgrey', '建議買入': 'red'},
+                        hover_data=['Name', 'ISIN'],
+                        title="市場機會地圖 (YTM vs Duration)"
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+                
+            else:
+                st.error("❌ 找不到可行解！請嘗試放寬「信評」或「存續期間」的限制。")
+    
 else:
-    st.info("👈 請調整左側參數並點擊按鈕開始計算")
+    st.info("👋 請在左側上傳你的 Excel 或 CSV 檔案以開始分析。")
