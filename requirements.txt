@@ -1,6 +1,7 @@
-streamlit
+streamlit>=1.40.0
 pandas
 numpy
 scipy
 plotly
 openpyxl  <-- 新加入的
+
