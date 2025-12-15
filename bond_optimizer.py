@@ -6,16 +6,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- 1. 基礎設定 ---
-st.set_page_config(page_title="債券策略大師 Pro (現金流版)", layout="wide")
+st.set_page_config(page_title="債券策略大師 Pro (旗艦版)", layout="wide")
 
-st.title("🛡️ 債券投資組合策略大師 Pro (現金流版)")
+st.title("🛡️ 債券投資組合策略大師 Pro (旗艦版)")
 st.markdown("""
 針對高資產客戶設計的五大策略：
 1. **收益最大化**：追求最高配息。
 2. **債券梯**：平均佈局年期，降低風險。
 3. **槓鈴策略**：長短債配置。
 4. **相對價值**：找出被低估的便宜債券。
-5. **現金流組合 (Cash Flow)**：<span style='color:orange'>🔥升級</span> 自訂本金與領息頻率 (月配/季配)，試算退休現金流。
+5. **現金流組合**：自訂本金與領息頻率，試算退休現金流。
 """, unsafe_allow_html=True)
 
 # --- 2. 輔助函式 ---
@@ -76,7 +76,6 @@ def clean_data(file):
             df['Is_Simulated_Month'] = True
         else:
             df['Is_Simulated_Month'] = False
-            # 統一歸類到 1-6 (假設半年配)
             df['Pay_Month'] = df['Pay_Month'].apply(lambda x: x if x <= 6 else x - 6)
 
         return df, None
@@ -178,21 +177,12 @@ def run_relative_value(df, allow_dup, top_n, min_dur):
     return pd.DataFrame(), df_calc
 
 def run_cash_flow_strategy(df, allow_dup, freq_type):
-    """
-    現金流策略：
-    freq_type: 1=月配(需6檔), 2=雙月配(需3檔), 3=季配(需2檔)
-    假設所有債券皆為半年配 (Semi-Annual)
-    """
     selected = []
     used_issuers = set()
     
-    # 定義需要的月份循環
-    if freq_type == "月月配 (12次/年)":
-        target_months = [1, 2, 3, 4, 5, 6] # 需要填滿所有月份
-    elif freq_type == "雙月配 (6次/年)":
-        target_months = [1, 3, 5] # 1,3,5 (會涵蓋 7,9,11)
-    else: # "季季配 (4次/年)"
-        target_months = [1, 4] # 1,4 (會涵蓋 7,10)
+    if freq_type == "月月配 (12次/年)": target_months = [1, 2, 3, 4, 5, 6]
+    elif freq_type == "雙月配 (6次/年)": target_months = [1, 3, 5]
+    else: target_months = [1, 4]
     
     weight_per_bond = 1.0 / len(target_months)
     
@@ -237,10 +227,10 @@ if uploaded_file:
         st.sidebar.header("🧠 步驟 2: 選擇策略")
         strategy = st.sidebar.radio(
             "請選擇投資策略：",
-            ["收益最大化", "債券梯", "槓鈴策略", "相對價值", "現金流組合 (Cash Flow)"]
+            ["收益最大化", "債券梯", "槓鈴策略", "相對價值", "現金流組合"]
         )
         
-        # 本金設定 (全域)
+        # 本金設定
         st.sidebar.markdown("---")
         st.sidebar.subheader("💰 投資設定")
         investment_amt = st.sidebar.number_input("投資本金 (元)", min_value=10000, value=1000000, step=100000)
@@ -281,20 +271,19 @@ if uploaded_file:
                 df_t = df_clean[df_clean['Rating_Source'].isin(target_rating)] if target_rating else df_clean
                 portfolio, df_with_alpha = run_relative_value(df_t, allow_dup, top_n, min_dur)
 
-        elif strategy == "現金流組合 (Cash Flow)":
+        elif strategy == "現金流組合":
             st.sidebar.caption("利用不同月份的半年配債券，構建現金流。")
             freq_type = st.sidebar.selectbox("目標領息頻率", ["月月配 (12次/年)", "雙月配 (6次/年)", "季季配 (4次/年)"])
             
             if df_clean['Is_Simulated_Month'].iloc[0]:
                 st.sidebar.warning("⚠️ 警告：使用模擬月份 (請補上到期日欄位)")
             
-            if st.sidebar.button("🚀 建立現金流組合"):
+            if st.sidebar.button("🚀 計算"):
                 portfolio = run_cash_flow_strategy(df_clean, allow_dup, freq_type)
 
         # --- 5. 結果顯示 ---
         if not portfolio.empty:
             portfolio['Allocation %'] = (portfolio['Weight'] * 100).round(1)
-            # 依照本金計算預估年配息金額
             portfolio['Annual_Coupon_Amt'] = (investment_amt * portfolio['Weight'] * (portfolio['YTM']/100)).round(0)
             
             avg_ytm = (portfolio['YTM'] * portfolio['Weight']).sum()
@@ -314,54 +303,71 @@ if uploaded_file:
                 st.dataframe(portfolio[cols], hide_index=True, use_container_width=True, key="res_tab")
 
             with c2:
-                # 現金流圖表 (所有策略通用，但現金流策略最準)
-                st.subheader("💰 預估每月入帳金額")
+                # 使用 Tabs 分頁解決圖表過多問題
+                tab1, tab2 = st.tabs(["📊 策略分析", "💰 現金流試算"])
                 
-                months = list(range(1, 13))
-                cash_flow = [0] * 12
-                
-                for idx, row in portfolio.iterrows():
-                    # 假設皆為半年配
-                    coupon_amt = row['Annual_Coupon_Amt'] / 2
-                    
-                    if 'Pay_Month' in row:
-                        m = int(row['Pay_Month']) # 1~6
-                    else:
-                        m = np.random.randint(1,7) # 其他策略若無月份則隨機模擬以示範
+                with tab1:
+                    # 邏輯：根據不同策略顯示「最適合」的圖表
+                    if strategy == "相對價值" and not df_with_alpha.empty:
+                        st.subheader("相對價值回歸分析")
+                        base_data = df_with_alpha
+                        x_range = np.linspace(base_data['Duration'].min(), base_data['Duration'].max(), 100)
+                        try:
+                            popt, _ = curve_fit(fit_yield_curve, base_data['Duration'], base_data['YTM'])
+                            y_fair = fit_yield_curve(x_range, *popt)
+                        except:
+                            z = np.polyfit(base_data['Duration'], base_data['YTM'], 2)
+                            p = np.poly1d(z)
+                            y_fair = p(x_range)
                         
-                    cash_flow[m-1] += coupon_amt
-                    cash_flow[m+5] += coupon_amt
-                
-                # 美化圖表
-                cf_df = pd.DataFrame({'Month': [f"{i}月" for i in months], 'Amount': cash_flow})
-                
-                # 判斷是否為「現金流策略」，圖表顏色不同
-                bar_color = '#2ecc71' if strategy == "現金流組合 (Cash Flow)" else '#3498db'
-                
-                fig = px.bar(cf_df, x='Month', y='Amount', title=f"本金 ${investment_amt:,.0f} 之每月現金流試算", text_auto=',.0f')
-                fig.update_traces(marker_color=bar_color)
-                fig.update_layout(yaxis_title="金額 (元)")
-                st.plotly_chart(fig, use_container_width=True, key="cf_chart")
-                
-                # 若是相對價值策略，額外顯示 RV 圖
-                if strategy == "相對價值" and not df_with_alpha.empty:
-                    st.markdown("---")
-                    st.subheader("📊 相對價值曲線")
-                    base_data = df_with_alpha
-                    x_range = np.linspace(base_data['Duration'].min(), base_data['Duration'].max(), 100)
-                    try:
-                        popt, _ = curve_fit(fit_yield_curve, base_data['Duration'], base_data['YTM'])
-                        y_fair = fit_yield_curve(x_range, *popt)
-                    except:
-                        z = np.polyfit(base_data['Duration'], base_data['YTM'], 2)
-                        p = np.poly1d(z)
-                        y_fair = p(x_range)
+                        fig_rv = go.Figure()
+                        fig_rv.add_trace(go.Scatter(x=base_data['Duration'], y=base_data['YTM'], mode='markers', name='市場', marker=dict(color='lightgrey', size=6)))
+                        fig_rv.add_trace(go.Scatter(x=x_range, y=y_fair, mode='lines', name='合理價值', line=dict(dash='dash', color='blue')))
+                        fig_rv.add_trace(go.Scatter(x=portfolio['Duration'], y=portfolio['YTM'], mode='markers', name='低估買入', marker=dict(color='red', size=15, symbol='star')))
+                        fig_rv.update_layout(xaxis_title="存續期間 (Duration)", yaxis_title="殖利率 (YTM)")
+                        st.plotly_chart(fig_rv, use_container_width=True, key="rv_chart_main")
+                        
+                    elif strategy == "現金流組合":
+                         st.info("👈 請切換至「現金流試算」分頁查看詳細圖表")
+                         
+                    else:
+                        # 對於 最大收益/債券梯/槓鈴，恢復顯示「散佈圖」
+                        st.subheader("風險/收益分佈圖")
+                        df_raw['Type'] = '未選入'
+                        portfolio['Type'] = '建議買入'
+                        if excluded_issuers: df_raw.loc[df_raw['Name'].isin(excluded_issuers), 'Type'] = '已剔除'
+                        all_plot = pd.concat([df_raw[~df_raw['ISIN'].isin(portfolio['ISIN'])], portfolio])
+                        color_map = {'未選入': '#e0e0e0', '建議買入': '#ef553b', '已剔除': 'rgba(0,0,0,0.1)'}
+                        fig = px.scatter(
+                            all_plot, x='Duration', y='YTM', color='Type', 
+                            color_discrete_map=color_map,
+                            size=all_plot['Type'].map({'未選入': 5, '建議買入': 15, '已剔除': 3}),
+                            hover_data=['Name'],
+                            title=f"{strategy} 策略分佈"
+                        )
+                        if strategy == "槓鈴策略":
+                            try:
+                                fig.add_vrect(x0=0, x1=short_lim, fillcolor="green", opacity=0.1, annotation_text="短債")
+                                fig.add_vrect(x0=long_lim, x1=20.0, fillcolor="orange", opacity=0.1, annotation_text="長債")
+                            except: pass
+                        st.plotly_chart(fig, use_container_width=True, key="main_scatter")
+
+                with tab2:
+                    st.subheader("預估每月入帳金額")
+                    months = list(range(1, 13))
+                    cash_flow = [0] * 12
+                    for idx, row in portfolio.iterrows():
+                        coupon_amt = row['Annual_Coupon_Amt'] / 2
+                        if 'Pay_Month' in row: m = int(row['Pay_Month'])
+                        else: m = np.random.randint(1,7)
+                        cash_flow[m-1] += coupon_amt
+                        cash_flow[m+5] += coupon_amt
                     
-                    fig_rv = go.Figure()
-                    fig_rv.add_trace(go.Scatter(x=base_data['Duration'], y=base_data['YTM'], mode='markers', name='市場', marker=dict(color='lightgrey')))
-                    fig_rv.add_trace(go.Scatter(x=x_range, y=y_fair, mode='lines', name='合理價值', line=dict(dash='dash')))
-                    fig_rv.add_trace(go.Scatter(x=portfolio['Duration'], y=portfolio['YTM'], mode='markers', name='Buy', marker=dict(color='red', size=15)))
-                    st.plotly_chart(fig_rv, use_container_width=True, key="rv_chart_extra")
+                    cf_df = pd.DataFrame({'Month': [f"{i}月" for i in months], 'Amount': cash_flow})
+                    fig_cf = px.bar(cf_df, x='Month', y='Amount', text_auto=',.0f', title=f"本金 ${investment_amt:,.0f} 之現金流模擬")
+                    fig_cf.update_traces(marker_color='#2ecc71')
+                    fig_cf.update_layout(yaxis_title="金額 (元)")
+                    st.plotly_chart(fig_cf, use_container_width=True, key="cf_chart_tab")
 
         elif uploaded_file and st.session_state.get('last_run'):
             st.warning("⚠️ 找不到符合條件的債券。")
