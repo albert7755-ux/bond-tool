@@ -1,20 +1,21 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import linprog, curve_fit
 import plotly.express as px
 import plotly.graph_objects as go
 
 # --- 1. 基礎設定 ---
-st.set_page_config(page_title="債券策略大師 Pro (Bond Strategy)", layout="wide")
+st.set_page_config(page_title="債券策略大師 Pro (Quant版)", layout="wide")
 
-st.title("🛡️ 債券投資組合策略大師 Pro")
+st.title("🛡️ 債券投資組合策略大師 Pro (Quant版)")
 st.markdown("""
-針對高資產客戶設計的三大經典策略 (含黑名單過濾)：
+針對高資產客戶設計的策略 (含學理相對價值分析)：
 1. **收益最大化 (Max Yield)**：在風險限制下追求最高配息。
 2. **債券梯 (Ladder)**：平均佈局不同年期，打造穩定現金流。
 3. **槓鈴策略 (Barbell)**：長短債配置，兼顧流動性與資本利得。
-""")
+4. **相對價值 (Relative Value)**：<span style='color:red'>🔥Quant 模型</span>，透過殖利率曲線回歸，找出被市場低估的「超額報酬」債券。
+""", unsafe_allow_html=True)
 
 # --- 2. 輔助函式 ---
 rating_map = {
@@ -69,16 +70,13 @@ def clean_data(file):
 def run_max_yield(df, target_dur, target_score, max_w):
     n = len(df)
     if n == 0: return pd.DataFrame()
-    
     c = -1 * df['YTM'].values
     A_ub = np.array([df['Duration'].values, df['Credit_Score'].values])
     b_ub = np.array([target_dur, target_score])
     A_eq = np.array([np.ones(n)])
     b_eq = np.array([1.0])
     bounds = [(0, max_w) for _ in range(n)]
-    
     res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-    
     if res.success:
         df['Weight'] = res.x
         return df[df['Weight'] > 0.001].copy()
@@ -88,28 +86,22 @@ def run_ladder(df, steps, allow_dup):
     selected = []
     used_issuers = set()
     weight_per_step = 1.0 / len(steps)
-    
     for (min_d, max_d) in steps:
         pool = df[(df['Duration'] >= min_d) & (df['Duration'] < max_d)].sort_values('YTM', ascending=False)
-        found = False
         for idx, row in pool.iterrows():
             if allow_dup or (row['Name'] not in used_issuers):
                 best_bond = row.copy()
                 best_bond['Weight'] = weight_per_step
                 selected.append(best_bond)
                 used_issuers.add(row['Name'])
-                found = True
                 break
-    if selected:
-        return pd.DataFrame(selected)
+    if selected: return pd.DataFrame(selected)
     return pd.DataFrame()
 
 def run_barbell(df, short_limit, long_limit, long_weight, allow_dup):
     short_pool = df[df['Duration'] <= short_limit].sort_values('YTM', ascending=False)
     long_pool = df[df['Duration'] >= long_limit].sort_values('YTM', ascending=False)
-    
-    selected = []
-    used_issuers = set()
+    selected, used_issuers = [], set()
     
     short_picks = []
     for idx, row in short_pool.iterrows():
@@ -130,9 +122,57 @@ def run_barbell(df, short_limit, long_limit, long_weight, allow_dup):
             used_issuers.add(row['Name'])
     
     final_list = short_picks + long_picks
-    if final_list:
-        return pd.DataFrame(final_list)
+    if final_list: return pd.DataFrame(final_list)
     return pd.DataFrame()
+
+# 新增：相對價值模型
+def fit_yield_curve(x, a, b):
+    # 使用對數函數擬合殖利率曲線: YTM = a + b * ln(Duration)
+    return a + b * np.log(x)
+
+def run_relative_value(df, allow_dup, top_n):
+    """相對價值策略：計算 Alpha (實際YTM - 合理YTM)"""
+    # 1. 計算回歸曲線 (Fair Value Curve)
+    # 避免 duration <= 0 導致 log 錯誤
+    df_calc = df[df['Duration'] > 0.1].copy()
+    
+    if len(df_calc) < 5: return pd.DataFrame() # 樣本太少無法回歸
+
+    try:
+        popt, _ = curve_fit(fit_yield_curve, df_calc['Duration'], df_calc['YTM'])
+        # 算出每一檔債券的「合理 YTM」
+        df_calc['Fair_YTM'] = fit_yield_curve(df_calc['Duration'], *popt)
+        # Alpha = 實際 - 合理
+        df_calc['Alpha'] = df_calc['YTM'] - df_calc['Fair_YTM']
+    except:
+        # 如果回歸失敗(例如數據太亂)，改用簡單線性回歸
+        z = np.polyfit(df_calc['Duration'], df_calc['YTM'], 2) # 2次多項式
+        p = np.poly1d(z)
+        df_calc['Fair_YTM'] = p(df_calc['Duration'])
+        df_calc['Alpha'] = df_calc['YTM'] - df_calc['Fair_YTM']
+
+    # 2. 挑選 Alpha 最高的債券 (即位於曲線最上方)
+    pool = df_calc.sort_values('Alpha', ascending=False)
+    
+    selected = []
+    used_issuers = set()
+    weight_per_bond = 1.0 / top_n
+    
+    count = 0
+    for idx, row in pool.iterrows():
+        if count >= top_n: break
+        if allow_dup or (row['Name'] not in used_issuers):
+            bond = row.copy()
+            bond['Weight'] = weight_per_bond
+            selected.append(bond)
+            used_issuers.add(row['Name'])
+            count += 1
+            
+    # 回傳結果，並包含 Alpha 欄位以便繪圖
+    if selected:
+        # 把 Alpha 資訊保留回原始 df 以便全域繪圖
+        return pd.DataFrame(selected), df_calc
+    return pd.DataFrame(), df_calc
 
 
 # --- 4. 主程式 UI ---
@@ -147,52 +187,40 @@ if uploaded_file:
     else:
         st.sidebar.success(f"已讀取 {len(df_raw)} 檔債券")
 
-        # --- 新增功能：黑名單過濾 ---
+        # 黑名單
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🚫 黑名單管理 (排除特定機構)")
-        
-        # 取得所有發行人列表，並排序
+        st.sidebar.subheader("🚫 黑名單管理")
         all_issuers = sorted(df_raw['Name'].astype(str).unique())
-        
-        # 多選單
-        excluded_issuers = st.sidebar.multiselect(
-            "請選擇要剔除的發行機構：",
-            options=all_issuers,
-            placeholder="搜尋並選擇..."
-        )
-        
-        # 過濾資料
+        excluded_issuers = st.sidebar.multiselect("剔除發行機構：", options=all_issuers)
         if excluded_issuers:
             df_clean = df_raw[~df_raw['Name'].isin(excluded_issuers)].copy()
-            st.sidebar.caption(f"已剔除 {len(excluded_issuers)} 家機構，剩餘 {len(df_clean)} 檔債券")
         else:
             df_clean = df_raw.copy()
         
-        # --- 策略選擇器 ---
+        # 策略選擇
         st.sidebar.header("🧠 步驟 2: 選擇策略")
         strategy = st.sidebar.radio(
             "請選擇投資策略：",
-            ["收益最大化 (Max Yield)", "債券梯 (Ladder)", "槓鈴策略 (Barbell)"]
+            ["收益最大化 (Max Yield)", "債券梯 (Ladder)", "槓鈴策略 (Barbell)", "相對價值 (Relative Value)"]
         )
         
+        # 共用風控
         allow_dup = True
-        if strategy in ["債券梯 (Ladder)", "槓鈴策略 (Barbell)"]:
+        if strategy != "收益最大化 (Max Yield)":
             st.sidebar.markdown("---")
             st.sidebar.subheader("🛡️ 集中度風控")
             allow_dup = st.sidebar.checkbox("允許發行機構重複?", value=True)
-            if not allow_dup:
-                st.sidebar.caption("✅ 已啟用：同一機構限購一檔")
 
         portfolio = pd.DataFrame()
-        
-        # --- 根據策略執行 ---
+        df_with_alpha = pd.DataFrame() # 用於相對價值的繪圖數據
+
+        # --- 策略執行區 ---
         if strategy == "收益最大化 (Max Yield)":
             st.sidebar.caption("說明：透過演算法算出最高殖利率組合。")
             t_dur = st.sidebar.slider("存續期間上限", 2.0, 15.0, 6.0)
             t_cred_label = st.sidebar.select_slider("最低信評要求", options=list(rating_map.keys()), value='BBB')
             t_cred = rating_map[t_cred_label]
             max_w = st.sidebar.slider("單檔上限", 0.05, 0.5, 0.2)
-            
             if st.sidebar.button("🚀 計算最佳配置"):
                 portfolio = run_max_yield(df_clean, t_dur, t_cred, max_w)
 
@@ -204,7 +232,6 @@ if uploaded_file:
                 "長梯 (5-15年)": [(5,7), (7,10), (10,12), (12,15)]
             }
             ladder_type = st.sidebar.selectbox("選擇梯型結構", list(ladder_options.keys()))
-            
             if st.sidebar.button("🚀 建立債券梯"):
                 portfolio = run_ladder(df_clean, ladder_options[ladder_type], allow_dup)
 
@@ -213,16 +240,31 @@ if uploaded_file:
             col_s, col_l = st.sidebar.columns(2)
             short_lim = col_s.number_input("短債定義 (年以下)", value=3.0)
             long_lim = col_l.number_input("長債定義 (年以上)", value=10.0)
-            
             long_w = st.sidebar.slider("長債資金佔比", 0.1, 0.9, 0.5)
-            
             if st.sidebar.button("🚀 建立槓鈴組合"):
                 portfolio = run_barbell(df_clean, short_lim, long_lim, long_w, allow_dup)
+
+        elif strategy == "相對價值 (Relative Value)":
+            st.sidebar.caption("說明：尋找位於殖利率曲線上方(被低估)的債券。")
+            top_n = st.sidebar.slider("挑選 Alpha 最高的幾檔?", 3, 10, 5)
+            # 信評篩選 (相對價值需要在同信評間比較才有意義)
+            st.sidebar.info("💡 建議先篩選特定信評等級 (例如只看 BBB)，模型會更準確。")
+            target_rating_group = st.sidebar.multiselect(
+                "篩選信評 (可複選, 留空則全選)", 
+                options=sorted(df_clean['Rating_Source'].unique()),
+                default=[]
+            )
+            
+            if st.sidebar.button("🚀 尋找被低估債券"):
+                df_target = df_clean.copy()
+                if target_rating_group:
+                    df_target = df_target[df_target['Rating_Source'].isin(target_rating_group)]
+                
+                portfolio, df_with_alpha = run_relative_value(df_target, allow_dup, top_n)
 
         # --- 5. 結果顯示區 ---
         if not portfolio.empty:
             portfolio['Allocation %'] = (portfolio['Weight'] * 100).round(1)
-            
             avg_ytm = (portfolio['YTM'] * portfolio['Weight']).sum()
             avg_dur = (portfolio['Duration'] * portfolio['Weight']).sum()
             unique_issuers = portfolio['Name'].nunique()
@@ -231,50 +273,80 @@ if uploaded_file:
             k1, k2, k3 = st.columns(3)
             k1.metric("預期年化殖利率 (YTM)", f"{avg_ytm:.2f}%")
             k2.metric("平均存續期間", f"{avg_dur:.2f} 年")
-            k3.metric("發行機構數", f"{unique_issuers} 家", delta="不重複" if unique_issuers == len(portfolio) else "有重複")
+            k3.metric("發行機構數", f"{unique_issuers} 家", delta="集中度檢查")
             
             c1, c2 = st.columns([4, 6])
             
             with c1:
                 st.subheader("📋 建議清單")
+                show_cols = ['Name', 'ISIN', 'Rating_Source', 'YTM', 'Duration', 'Allocation %']
+                if 'Alpha' in portfolio.columns: show_cols.insert(4, 'Alpha') # 顯示 Alpha
+                
                 st.dataframe(
-                    portfolio[['Name', 'ISIN', 'Rating_Source', 'YTM', 'Duration', 'Allocation %']]
-                    .sort_values('Duration'),
-                    hide_index=True,
-                    use_container_width=True,
-                    key="res_table"
+                    portfolio[show_cols].sort_values('Allocation %', ascending=False),
+                    hide_index=True, use_container_width=True, key="res_table"
                 )
                 
             with c2:
                 st.subheader("📊 策略視覺化")
                 
-                # 繪圖時包含被剔除的資料 (灰色+透明) 以顯示全貌
-                df_raw['Type'] = '未選入'
-                portfolio['Type'] = '建議買入'
-                
-                # 將「被剔除的」標記出來
-                if excluded_issuers:
-                    df_raw.loc[df_raw['Name'].isin(excluded_issuers), 'Type'] = '已剔除(黑名單)'
-                
-                # 合併繪圖數據 (移除 portfolio 原本在 df_raw 的重複項，避免重疊)
-                plot_base = df_raw[~df_raw['ISIN'].isin(portfolio['ISIN'])]
-                all_plot = pd.concat([plot_base, portfolio])
-                
-                color_map = {'未選入': '#e0e0e0', '建議買入': '#ef553b', '已剔除(黑名單)': 'rgba(0,0,0,0.1)'}
-                
-                fig = px.scatter(
-                    all_plot, x='Duration', y='YTM', color='Type',
-                    color_discrete_map=color_map,
-                    size=all_plot['Type'].map({'未選入': 5, '建議買入': 15, '已剔除(黑名單)': 3}),
-                    hover_data=['Name', 'ISIN'],
-                    title=f"目前策略: {strategy}"
-                )
-                
-                if strategy == "槓鈴策略 (Barbell)":
-                    fig.add_vrect(x0=0, x1=short_lim, fillcolor="green", opacity=0.1, annotation_text="短債")
-                    fig.add_vrect(x0=long_lim, x1=20.0, fillcolor="orange", opacity=0.1, annotation_text="長債")
-                
-                st.plotly_chart(fig, use_container_width=True, key="main_chart")
+                # 繪圖數據準備
+                if strategy == "相對價值 (Relative Value)" and not df_with_alpha.empty:
+                    # 使用算過 Alpha 的資料集來畫圖
+                    base_data = df_with_alpha
+                    # 畫出回歸曲線 (Fair Value)
+                    x_range = np.linspace(base_data['Duration'].min(), base_data['Duration'].max(), 100)
+                    try:
+                        popt, _ = curve_fit(fit_yield_curve, base_data['Duration'], base_data['YTM'])
+                        y_fair = fit_yield_curve(x_range, *popt)
+                    except:
+                        # 降級處理
+                        z = np.polyfit(base_data['Duration'], base_data['YTM'], 2)
+                        p = np.poly1d(z)
+                        y_fair = p(x_range)
+                    
+                    fig = go.Figure()
+                    # 1. 畫所有點
+                    fig.add_trace(go.Scatter(
+                        x=base_data['Duration'], y=base_data['YTM'],
+                        mode='markers', name='市場債券',
+                        marker=dict(color='lightgrey', size=8),
+                        text=base_data['Name']
+                    ))
+                    # 2. 畫合理價值曲線
+                    fig.add_trace(go.Scatter(
+                        x=x_range, y=y_fair,
+                        mode='lines', name='合理價值曲線 (Fair Value)',
+                        line=dict(color='blue', dash='dash')
+                    ))
+                    # 3. 畫選中的點 (Alpha 高的)
+                    fig.add_trace(go.Scatter(
+                        x=portfolio['Duration'], y=portfolio['YTM'],
+                        mode='markers', name='被低估債券 (Buy)',
+                        marker=dict(color='red', size=15, symbol='star'),
+                        text=portfolio['Name']
+                    ))
+                    fig.update_layout(title="相對價值模型 (尋找曲線上方)", xaxis_title="Duration", yaxis_title="YTM")
+                    st.plotly_chart(fig, use_container_width=True, key="rv_chart")
+                    
+                else:
+                    # 一般模式的散佈圖
+                    df_raw['Type'] = '未選入'
+                    portfolio['Type'] = '建議買入'
+                    if excluded_issuers: df_raw.loc[df_raw['Name'].isin(excluded_issuers), 'Type'] = '已剔除'
+                    
+                    plot_base = df_raw[~df_raw['ISIN'].isin(portfolio['ISIN'])]
+                    all_plot = pd.concat([plot_base, portfolio])
+                    
+                    color_map = {'未選入': '#e0e0e0', '建議買入': '#ef553b', '已剔除': 'rgba(0,0,0,0.1)'}
+                    fig = px.scatter(
+                        all_plot, x='Duration', y='YTM', color='Type',
+                        color_discrete_map=color_map,
+                        size=all_plot['Type'].map({'未選入': 5, '建議買入': 15, '已剔除': 3}),
+                        hover_data=['Name', 'ISIN'],
+                        title=f"目前策略: {strategy}"
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key="main_chart")
                 
         elif uploaded_file and st.session_state.get('last_run'):
             st.warning("⚠️ 找不到符合條件的債券。")
