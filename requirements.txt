@@ -3,3 +3,4 @@ pandas
 numpy
 scipy
 plotly
+openpyxl  <-- 新加入的
