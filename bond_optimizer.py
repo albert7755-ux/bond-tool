@@ -10,7 +10,7 @@ st.set_page_config(page_title="債券策略大師 Pro (Bond Strategy)", layout="
 
 st.title("🛡️ 債券投資組合策略大師 Pro")
 st.markdown("""
-針對高資產客戶設計的三大經典策略 (含集中度控管)：
+針對高資產客戶設計的三大經典策略 (含黑名單過濾)：
 1. **收益最大化 (Max Yield)**：在風險限制下追求最高配息。
 2. **債券梯 (Ladder)**：平均佈局不同年期，打造穩定現金流。
 3. **槓鈴策略 (Barbell)**：長短債配置，兼顧流動性與資本利得。
@@ -64,11 +64,12 @@ def clean_data(file):
     except Exception as e:
         return None, str(e)
 
-# --- 3. 策略邏輯核心 (修改過) ---
+# --- 3. 策略邏輯核心 ---
 
 def run_max_yield(df, target_dur, target_score, max_w):
-    """策略 A: 線性規劃 (數學上較難直接加入「名稱不重複」的硬限制，故維持原樣，靠單檔上限控制)"""
     n = len(df)
+    if n == 0: return pd.DataFrame()
+    
     c = -1 * df['YTM'].values
     A_ub = np.array([df['Duration'].values, df['Credit_Score'].values])
     b_ub = np.array([target_dur, target_score])
@@ -84,68 +85,50 @@ def run_max_yield(df, target_dur, target_score, max_w):
     return pd.DataFrame()
 
 def run_ladder(df, steps, allow_dup):
-    """策略 B: 債券梯 (加入重複檢查)"""
     selected = []
-    used_issuers = set() # 用來記錄已經買過的發行機構
-    
+    used_issuers = set()
     weight_per_step = 1.0 / len(steps)
     
     for (min_d, max_d) in steps:
-        # 篩選出該年期的候選池，並按 YTM 從高到低排
         pool = df[(df['Duration'] >= min_d) & (df['Duration'] < max_d)].sort_values('YTM', ascending=False)
-        
         found = False
         for idx, row in pool.iterrows():
-            # 檢查邏輯：如果允許重複 OR 沒出現過 => 才買入
             if allow_dup or (row['Name'] not in used_issuers):
                 best_bond = row.copy()
                 best_bond['Weight'] = weight_per_step
                 selected.append(best_bond)
-                used_issuers.add(row['Name']) # 登記起來
+                used_issuers.add(row['Name'])
                 found = True
-                break # 這一階梯買到了，跳出迴圈，去下一個階梯
-        
-        if not found:
-            # 這一層如果都買不到(例如都被買光了)，這裡留空或你可以設計候補邏輯
-            pass
-            
+                break
     if selected:
         return pd.DataFrame(selected)
     return pd.DataFrame()
 
 def run_barbell(df, short_limit, long_limit, long_weight, allow_dup):
-    """策略 C: 槓鈴策略 (加入重複檢查)"""
-    
-    # 先把候選名單依 YTM 排序
     short_pool = df[df['Duration'] <= short_limit].sort_values('YTM', ascending=False)
     long_pool = df[df['Duration'] >= long_limit].sort_values('YTM', ascending=False)
     
     selected = []
     used_issuers = set()
     
-    # 1. 挑選短債 (取前 2 名)
     short_picks = []
     for idx, row in short_pool.iterrows():
-        if len(short_picks) >= 2: break # 挑滿2檔就停
+        if len(short_picks) >= 2: break
         if allow_dup or (row['Name'] not in used_issuers):
             row = row.copy()
-            # 權重計算：短債總倉位 (1-long_weight) / 2
             row['Weight'] = (1 - long_weight) / 2 
             short_picks.append(row)
             used_issuers.add(row['Name'])
             
-    # 2. 挑選長債 (取前 2 名)
     long_picks = []
     for idx, row in long_pool.iterrows():
-        if len(long_picks) >= 2: break # 挑滿2檔就停
+        if len(long_picks) >= 2: break
         if allow_dup or (row['Name'] not in used_issuers):
             row = row.copy()
-            # 權重計算：長債總倉位 (long_weight) / 2
             row['Weight'] = long_weight / 2
             long_picks.append(row)
             used_issuers.add(row['Name'])
     
-    # 合併結果
     final_list = short_picks + long_picks
     if final_list:
         return pd.DataFrame(final_list)
@@ -157,12 +140,33 @@ st.sidebar.header("📂 步驟 1: 資料匯入")
 uploaded_file = st.sidebar.file_uploader("上傳債券清單", type=['xlsx', 'csv'])
 
 if uploaded_file:
-    df_clean, err = clean_data(uploaded_file)
+    df_raw, err = clean_data(uploaded_file)
     
     if err:
         st.error(f"錯誤: {err}")
     else:
-        st.sidebar.success(f"已讀取 {len(df_clean)} 檔債券")
+        st.sidebar.success(f"已讀取 {len(df_raw)} 檔債券")
+
+        # --- 新增功能：黑名單過濾 ---
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🚫 黑名單管理 (排除特定機構)")
+        
+        # 取得所有發行人列表，並排序
+        all_issuers = sorted(df_raw['Name'].astype(str).unique())
+        
+        # 多選單
+        excluded_issuers = st.sidebar.multiselect(
+            "請選擇要剔除的發行機構：",
+            options=all_issuers,
+            placeholder="搜尋並選擇..."
+        )
+        
+        # 過濾資料
+        if excluded_issuers:
+            df_clean = df_raw[~df_raw['Name'].isin(excluded_issuers)].copy()
+            st.sidebar.caption(f"已剔除 {len(excluded_issuers)} 家機構，剩餘 {len(df_clean)} 檔債券")
+        else:
+            df_clean = df_raw.copy()
         
         # --- 策略選擇器 ---
         st.sidebar.header("🧠 步驟 2: 選擇策略")
@@ -171,12 +175,11 @@ if uploaded_file:
             ["收益最大化 (Max Yield)", "債券梯 (Ladder)", "槓鈴策略 (Barbell)"]
         )
         
-        # 新增：風控選項 (只在 Ladder 和 Barbell 出現)
         allow_dup = True
         if strategy in ["債券梯 (Ladder)", "槓鈴策略 (Barbell)"]:
             st.sidebar.markdown("---")
             st.sidebar.subheader("🛡️ 集中度風控")
-            allow_dup = st.sidebar.checkbox("允許發行機構重複?", value=True, help="若取消勾選，系統會強制挑選不同發行人的債券")
+            allow_dup = st.sidebar.checkbox("允許發行機構重複?", value=True)
             if not allow_dup:
                 st.sidebar.caption("✅ 已啟用：同一機構限購一檔")
 
@@ -194,7 +197,7 @@ if uploaded_file:
                 portfolio = run_max_yield(df_clean, t_dur, t_cred, max_w)
 
         elif strategy == "債券梯 (Ladder)":
-            st.sidebar.caption("說明：資金平均分配在不同年期，每年有資金到期。")
+            st.sidebar.caption("說明：資金平均分配在不同年期。")
             ladder_options = {
                 "短梯 (1-5年)": [(1,2), (2,3), (3,4), (4,5)],
                 "中梯 (3-7年)": [(3,4), (4,5), (5,6), (6,7)],
@@ -245,14 +248,24 @@ if uploaded_file:
             with c2:
                 st.subheader("📊 策略視覺化")
                 
-                df_clean['Type'] = '未選入'
+                # 繪圖時包含被剔除的資料 (灰色+透明) 以顯示全貌
+                df_raw['Type'] = '未選入'
                 portfolio['Type'] = '建議買入'
-                all_plot = pd.concat([df_clean, portfolio])
+                
+                # 將「被剔除的」標記出來
+                if excluded_issuers:
+                    df_raw.loc[df_raw['Name'].isin(excluded_issuers), 'Type'] = '已剔除(黑名單)'
+                
+                # 合併繪圖數據 (移除 portfolio 原本在 df_raw 的重複項，避免重疊)
+                plot_base = df_raw[~df_raw['ISIN'].isin(portfolio['ISIN'])]
+                all_plot = pd.concat([plot_base, portfolio])
+                
+                color_map = {'未選入': '#e0e0e0', '建議買入': '#ef553b', '已剔除(黑名單)': 'rgba(0,0,0,0.1)'}
                 
                 fig = px.scatter(
                     all_plot, x='Duration', y='YTM', color='Type',
-                    color_discrete_map={'未選入': '#e0e0e0', '建議買入': '#ef553b'},
-                    size=all_plot['Type'].map({'未選入': 5, '建議買入': 15}),
+                    color_discrete_map=color_map,
+                    size=all_plot['Type'].map({'未選入': 5, '建議買入': 15, '已剔除(黑名單)': 3}),
                     hover_data=['Name', 'ISIN'],
                     title=f"目前策略: {strategy}"
                 )
@@ -264,7 +277,7 @@ if uploaded_file:
                 st.plotly_chart(fig, use_container_width=True, key="main_chart")
                 
         elif uploaded_file and st.session_state.get('last_run'):
-            st.warning("⚠️ 找不到符合條件的債券，請放寬條件 (例如允許重複或調整年期)。")
+            st.warning("⚠️ 找不到符合條件的債券。")
 
 else:
     st.info("👈 請先在左側上傳 Excel 檔案")
